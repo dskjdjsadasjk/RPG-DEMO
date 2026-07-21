@@ -2,11 +2,6 @@ namespace RPGDemo.GameFramework
 {
     public class PlayerController : Controller
     {
-        protected virtual void Awake()
-        {
-            SetIsPlayerController(true);
-        }
-
         public override bool IsLocalController => true;
 
         protected override void OnPossess(Pawn inPawn)

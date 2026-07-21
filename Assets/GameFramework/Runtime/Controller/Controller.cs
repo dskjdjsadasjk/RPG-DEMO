@@ -14,7 +14,6 @@ namespace RPGDemo.GameFramework
 
         private bool hasAuthority = true;
         private bool canPossessWithoutAuthority;
-        private bool isPlayerController;
 
         private int ignoreMoveInput;
         private int ignoreLookInput;
@@ -28,7 +27,7 @@ namespace RPGDemo.GameFramework
 
         public bool HasAuthority => hasAuthority;
         public bool CanPossessWithoutAuthority => canPossessWithoutAuthority;
-        public bool IsPlayerController => isPlayerController;
+        public bool IsPlayerController => this is PlayerController;
         public virtual bool IsLocalController => true;
 
         public bool IsMoveInputIgnored => ignoreMoveInput > 0;
@@ -37,11 +36,6 @@ namespace RPGDemo.GameFramework
         public event Action<Pawn, Pawn> PossessedPawnChanged;
         public event Action<string, string> StateChanged;
         public event Action<Quaternion> ControlRotationChanged;
-
-        protected void SetIsPlayerController(bool value)
-        {
-            isPlayerController = value;
-        }
 
         public PossessionResult Possess(Pawn inPawn)
         {
