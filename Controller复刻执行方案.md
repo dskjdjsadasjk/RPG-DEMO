@@ -118,7 +118,6 @@ private Transform startSpot;
 
 private bool hasAuthority = true;
 private bool canPossessWithoutAuthority;
-private bool isPlayerController;
 
 private int ignoreMoveInput;
 private int ignoreLookInput;
@@ -141,6 +140,12 @@ public virtual bool IsLocalController { get; }
 
 public bool IsMoveInputIgnored { get; }
 public bool IsLookInputIgnored { get; }
+```
+
+`IsPlayerController` 不保存独立状态，直接根据 Controller 的实际类型判断：
+
+```csharp
+public bool IsPlayerController => this is PlayerController;
 ```
 
 单机阶段：

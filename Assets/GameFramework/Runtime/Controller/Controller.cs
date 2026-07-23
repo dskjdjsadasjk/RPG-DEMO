@@ -260,6 +260,20 @@ namespace RPGDemo.GameFramework
             ignoreLookInput = 0;
         }
 
+        protected virtual void Update()
+        {
+            TickActor(Time.deltaTime);
+        }
+
+        protected virtual void TickActor(float deltaTime)
+        {
+            Tick(deltaTime);
+        }
+
+        protected virtual void Tick(float deltaTime)
+        {
+        }
+
         protected virtual void OnDestroy()
         {
             UnPossess();
