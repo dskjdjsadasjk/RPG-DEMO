@@ -3,6 +3,7 @@ using UnityEngine;
 
 namespace RPGDemo.GameFramework
 {
+    [DefaultExecutionOrder(-100)]
     public class Controller : MonoBehaviour
     {
         private Pawn pawn;

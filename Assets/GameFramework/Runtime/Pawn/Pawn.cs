@@ -7,6 +7,7 @@ namespace RPGDemo.GameFramework
         private Controller controller;
         private PlayerState playerState;
         private InputComponent inputComponent;
+        private PawnMovementComponent movementComponent;
         private Vector3 controlInputVector;
         private Vector3 lastControlInputVector;
         private bool isDestroying;
@@ -14,6 +15,7 @@ namespace RPGDemo.GameFramework
         public Controller Controller => controller;
         public PlayerState PlayerState => playerState;
         public InputComponent InputComponent => inputComponent;
+        public PawnMovementComponent MovementComponent => movementComponent;
         public Vector3 PendingMovementInputVector => controlInputVector;
         public Vector3 LastMovementInputVector => lastControlInputVector;
         public bool IsDestroying => isDestroying;
@@ -107,9 +109,15 @@ namespace RPGDemo.GameFramework
             float scaleValue = 1f,
             bool force = false)
         {
-            if (force || controller == null || !controller.IsMoveInputIgnored)
+            Vector3 worldInput = worldDirection * scaleValue;
+
+            if (movementComponent != null)
             {
-                controlInputVector += worldDirection * scaleValue;
+                movementComponent.AddInputVector(worldInput, force);
+            }
+            else
+            {
+                InternalAddMovementInput(worldInput, force);
             }
         }
 
@@ -124,6 +132,39 @@ namespace RPGDemo.GameFramework
         }
 
         public virtual Vector3 ConsumeMovementInputVector()
+        {
+            if (movementComponent != null)
+            {
+                return movementComponent.ConsumeInputVector();
+            }
+
+            return InternalConsumeMovementInputVector();
+        }
+
+        internal void SetMovementComponent(PawnMovementComponent newMovementComponent)
+        {
+            movementComponent = newMovementComponent;
+        }
+
+        internal void InternalAddMovementInput(Vector3 worldInput, bool force = false)
+        {
+            if (force || controller == null || !controller.IsMoveInputIgnored)
+            {
+                controlInputVector += worldInput;
+            }
+        }
+
+        internal Vector3 InternalGetPendingMovementInputVector()
+        {
+            return controlInputVector;
+        }
+
+        internal Vector3 InternalGetLastMovementInputVector()
+        {
+            return lastControlInputVector;
+        }
+
+        internal Vector3 InternalConsumeMovementInputVector()
         {
             lastControlInputVector = controlInputVector;
             controlInputVector = Vector3.zero;
