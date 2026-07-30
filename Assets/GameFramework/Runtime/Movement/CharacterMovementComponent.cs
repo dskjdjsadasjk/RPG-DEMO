@@ -139,6 +139,13 @@ namespace RPGDemo.GameFramework
 
         protected virtual void PhysWalking(float deltaTime)
         {
+            if (characterOwner.Controller == null)
+            {
+                acceleration = Vector3.zero;
+                velocity = Vector3.zero;
+                return;
+            }
+
             acceleration = Vector3.ProjectOnPlane(acceleration, Vector3.up);
             velocity = Vector3.ProjectOnPlane(velocity, Vector3.up);
 
