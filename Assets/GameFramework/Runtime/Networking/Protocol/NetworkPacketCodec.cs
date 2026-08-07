@@ -175,6 +175,20 @@ namespace RPGDemo.GameFramework.Networking.Protocol
             return true;
         }
 
+        public bool TryReadBytes(int count, out byte[] value)
+        {
+            value = null;
+            if (!HasRemaining(count))
+            {
+                return false;
+            }
+
+            value = new byte[count];
+            Buffer.BlockCopy(buffer, position, value, 0, count);
+            position += count;
+            return true;
+        }
+
         private bool HasRemaining(int count) => count >= 0 && position <= buffer.Length - count;
     }
 

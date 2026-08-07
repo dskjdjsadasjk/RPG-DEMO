@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using RPGDemo.GameFramework.Networking.Identity;
 using RPGDemo.GameFramework.Networking.Protocol;
+using RPGDemo.GameFramework.Networking.Replication;
 using UnityEngine;
 using Object = UnityEngine.Object;
 
@@ -95,6 +96,12 @@ namespace RPGDemo.GameFramework.Networking.Server
                     spawnPose.rotation,
                     connection.ConnectionId,
                     authorityEpoch: 1);
+
+                ReplicatedHealth replicatedHealth = pawnIdentity.GetComponent<ReplicatedHealth>();
+                if (replicatedHealth != null)
+                {
+                    replicatedHealth.SetHealth(100 + (int)connection.ConnectionId);
+                }
 
                 Pawn pawn = pawnIdentity.GetComponent<Pawn>();
                 if (pawn == null)

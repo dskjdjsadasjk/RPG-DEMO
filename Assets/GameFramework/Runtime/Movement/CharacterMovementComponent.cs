@@ -48,6 +48,33 @@ namespace RPGDemo.GameFramework
         public Vector3 Velocity => velocity;
         public float AnalogInputModifier => analogInputModifier;
 
+        public void SimulateNetworkMove(Vector3 worldInput, float deltaTime)
+        {
+            if (!HasValidData()
+                || characterOwner == null
+                || updatedComponent == null
+                || !updatedComponent.enabled
+                || deltaTime < MinTickTime)
+            {
+                return;
+            }
+
+            ControlledCharacterMove(Vector3.ClampMagnitude(worldInput, 1f), deltaTime);
+        }
+
+        public void ApplyNetworkState(
+            Vector3 position,
+            Quaternion rotation,
+            Vector3 authoritativeVelocity,
+            MovementMode authoritativeMovementMode)
+        {
+            transform.SetPositionAndRotation(position, rotation);
+            velocity = authoritativeVelocity;
+            acceleration = Vector3.zero;
+            analogInputModifier = 0f;
+            movementMode = authoritativeMovementMode;
+        }
+
         protected override void Awake()
         {
             base.Awake();

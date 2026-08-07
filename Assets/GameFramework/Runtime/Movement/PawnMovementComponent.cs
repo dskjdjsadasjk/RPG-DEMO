@@ -9,6 +9,8 @@ namespace RPGDemo.GameFramework
     {
         private Pawn pawnOwner;
 
+        public bool AutomaticTickEnabled { get; set; } = true;
+
         public Pawn PawnOwner => pawnOwner;
 
         protected virtual void Awake()
@@ -22,7 +24,10 @@ namespace RPGDemo.GameFramework
 
         protected virtual void Update()
         {
-            TickComponent(Time.deltaTime);
+            if (AutomaticTickEnabled)
+            {
+                TickComponent(Time.deltaTime);
+            }
         }
 
         public virtual void AddInputVector(Vector3 worldInput, bool force = false)

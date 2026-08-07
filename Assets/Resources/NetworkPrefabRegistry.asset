@@ -1,0 +1,17 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 452e89ee5e3f3264fac964c44385b8a3, type: 3}
+  m_Name: NetworkPrefabRegistry
+  m_EditorClassIdentifier: Assembly-CSharp::RPGDemo.GameFramework.Networking.Identity.NetworkPrefabRegistry
+  entries:
+  - prefabId: 1
+    prefab: {fileID: 4787252693704101293, guid: 1c1427fe73a0465448c28f0485aeec1c, type: 3}

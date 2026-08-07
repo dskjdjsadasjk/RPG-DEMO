@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using RPGDemo.GameFramework.Networking.Identity;
 
 namespace RPGDemo.GameFramework.Networking.Replication
@@ -13,6 +14,9 @@ namespace RPGDemo.GameFramework.Networking.Replication
 
     public sealed class ActorReplicationChannel
     {
+        private readonly Dictionary<ushort, ObjectReplicator> replicatorsById
+            = new Dictionary<ushort, ObjectReplicator>();
+
         internal ActorReplicationChannel(
             ushort channelId,
             GameNetConnection connection,
@@ -29,6 +33,7 @@ namespace RPGDemo.GameFramework.Networking.Replication
             ChannelId = channelId;
             State = remoteOpenIsComplete ? ActorChannelState.Open : ActorChannelState.Opening;
             SpawnAcked = remoteOpenIsComplete;
+            CreateObjectReplicators(actor);
         }
 
         public ushort ChannelId { get; }
@@ -38,6 +43,13 @@ namespace RPGDemo.GameFramework.Networking.Replication
         public bool SpawnAcked { get; private set; }
         public ActorChannelState State { get; private set; }
         public uint LastReplicatedTick { get; internal set; }
+        public uint LastMovementReplicatedTick { get; internal set; }
+        public IReadOnlyCollection<ObjectReplicator> ObjectReplicators => replicatorsById.Values;
+
+        internal bool TryGetObjectReplicator(ushort replicationId, out ObjectReplicator replicator)
+        {
+            return replicatorsById.TryGetValue(replicationId, out replicator);
+        }
 
         internal bool TryMarkSpawnAcked(uint netId, ushort authorityEpoch)
         {
@@ -63,7 +75,33 @@ namespace RPGDemo.GameFramework.Networking.Replication
 
             State = ActorChannelState.Closing;
             SpawnAcked = false;
+            replicatorsById.Clear();
             State = ActorChannelState.Closed;
+        }
+
+        private void CreateObjectReplicators(NetworkIdentity actor)
+        {
+            NetworkBehaviour[] behaviours = actor.GetComponentsInChildren<NetworkBehaviour>(true);
+            for (int i = 0; i < behaviours.Length; i++)
+            {
+                NetworkBehaviour behaviour = behaviours[i];
+                if (behaviour == null)
+                {
+                    continue;
+                }
+
+                if (behaviour.ReplicationId == 0
+                    || replicatorsById.ContainsKey(behaviour.ReplicationId))
+                {
+                    throw new InvalidOperationException(
+                        $"NetworkIdentity '{actor.name}' has duplicate or invalid ReplicationId "
+                        + $"{behaviour.ReplicationId}.");
+                }
+
+                replicatorsById.Add(
+                    behaviour.ReplicationId,
+                    new ObjectReplicator(behaviour));
+            }
         }
     }
 }

@@ -44,9 +44,15 @@ namespace RPGDemo.GameFramework.Networking.Server
         private static int CompareStarts(NetworkPlayerStart left, NetworkPlayerStart right)
         {
             int orderComparison = left.spawnOrder.CompareTo(right.spawnOrder);
-            return orderComparison != 0
-                ? orderComparison
-                : left.GetInstanceID().CompareTo(right.GetInstanceID());
+            if (orderComparison != 0)
+            {
+                return orderComparison;
+            }
+
+            int nameComparison = string.CompareOrdinal(left.name, right.name);
+            return nameComparison != 0
+                ? nameComparison
+                : left.transform.GetSiblingIndex().CompareTo(right.transform.GetSiblingIndex());
         }
 
         private static void RemoveMissingStarts()

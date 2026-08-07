@@ -12,6 +12,8 @@ namespace RPGDemo.GameFramework.Networking
     {
         public const ushort DefaultPort = 7777;
         public const ushort DefaultTickRate = 60;
+        public const ushort DefaultStateReplicationRate = 5;
+        public const ushort DefaultMovementSnapshotRate = 20;
         public const float HandshakeTimeoutSeconds = 10f;
 
         private readonly INetworkTransport transport;
@@ -88,10 +90,41 @@ namespace RPGDemo.GameFramework.Networking
                 ProcessTransportEvent(transportEvents[i]);
             }
 
-            TickHandshakeTimeouts(Mathf.Max(0f, unscaledDeltaTime));
+            float safeDeltaTime = Mathf.Max(0f, unscaledDeltaTime);
+            TickHandshakeTimeouts(safeDeltaTime);
+            AdvanceServerClock(safeDeltaTime);
+            ReplicateActorStates();
+            ReplicateCharacterSnapshots();
             transport.Flush();
+        }
 
-            AdvanceServerClock(Mathf.Max(0f, unscaledDeltaTime));
+        public bool SendCharacterMove(
+            NetworkIdentity identity,
+            uint sequence,
+            uint clientTick,
+            float deltaTime,
+            Vector3 worldInput,
+            float controlYaw)
+        {
+            if (Mode != NetworkProcessMode.Client
+                || ServerConnection == null
+                || !ServerConnection.IsReady
+                || identity == null
+                || !identity.IsSpawned
+                || identity.Role != NetworkRole.AutonomousProxy)
+            {
+                return false;
+            }
+
+            byte[] packet = CharacterMovementProtocol.CreateClientMove(
+                identity.NetId,
+                identity.AuthorityEpoch,
+                sequence,
+                clientTick,
+                deltaTime,
+                worldInput,
+                controlYaw);
+            return SendUnreliable(ServerConnection, packet);
         }
 
         public void DisconnectConnection(GameNetConnection connection, string reason)
@@ -308,6 +341,40 @@ namespace RPGDemo.GameFramework.Networking
                 return;
             }
 
+            if (ObjectReplicationProtocol.TryReadMessageType(
+                    packet,
+                    out ObjectReplicationMessageType objectMessageType))
+            {
+                if (!connection.IsReady)
+                {
+                    RejectOrClose(
+                        connection,
+                        ConnectionRejectReason.UnexpectedMessage,
+                        $"Object message {objectMessageType} received before Ready");
+                    return;
+                }
+
+                HandleObjectReplicationPacket(connection, objectMessageType, packet);
+                return;
+            }
+
+            if (CharacterMovementProtocol.TryReadMessageType(
+                    packet,
+                    out CharacterMovementMessageType movementMessageType))
+            {
+                if (!connection.IsReady)
+                {
+                    RejectOrClose(
+                        connection,
+                        ConnectionRejectReason.UnexpectedMessage,
+                        $"Movement message {movementMessageType} received before Ready");
+                    return;
+                }
+
+                HandleCharacterMovementPacket(connection, movementMessageType, packet);
+                return;
+            }
+
             RejectOrClose(connection, ConnectionRejectReason.InvalidPacket, "Unknown or empty network packet");
         }
 
@@ -466,6 +533,8 @@ namespace RPGDemo.GameFramework.Networking
                     connection.DisplayName = clientDisplayName;
                     connection.ServerTickAtWelcome = serverTickAtWelcome;
                     connection.ServerTickRate = tickRate;
+                    serverTick = serverTickAtWelcome;
+                    serverTickAccumulator = 0d;
                     if (!TrySendReliable(
                             connection,
                             ConnectionProtocol.CreateClientReady(connectionId),
@@ -541,6 +610,7 @@ namespace RPGDemo.GameFramework.Networking
             Debug.Log(
                 $"[Net][DS] ActorChannel {channelId} open acknowledged by connection "
                 + $"{connection.ConnectionId} for NetId={netId}.");
+            SendInitialObjectStates(connection, channel);
         }
 
         private void HandleActorChannelOpen(GameNetConnection connection, byte[] packet)
@@ -630,6 +700,160 @@ namespace RPGDemo.GameFramework.Networking
             NetworkObjectSpawned?.Invoke(identity);
         }
 
+        private void HandleObjectReplicationPacket(
+            GameNetConnection connection,
+            ObjectReplicationMessageType messageType,
+            byte[] packet)
+        {
+            if (Mode == NetworkProcessMode.DedicatedServer)
+            {
+                RejectOrClose(
+                    connection,
+                    ConnectionRejectReason.UnexpectedMessage,
+                    $"Client cannot send {messageType}");
+                return;
+            }
+
+            if (messageType != ObjectReplicationMessageType.ObjectState
+                || !ObjectReplicationProtocol.TryReadObjectState(packet, out ObjectStateMessage state)
+                || !connection.TryGetActorChannel(state.ChannelId, out ActorReplicationChannel channel)
+                || channel.NetId != state.NetId
+                || channel.Actor == null
+                || channel.Actor.AuthorityEpoch != state.AuthorityEpoch
+                || !channel.TryGetObjectReplicator(state.ReplicationId, out ObjectReplicator replicator)
+                || !replicator.TryApplyState(
+                    state.Sequence,
+                    state.State,
+                    state.IsInitialState,
+                    out _))
+            {
+                CloseConnection(connection, "Invalid ObjectState packet");
+            }
+        }
+
+        private void HandleCharacterMovementPacket(
+            GameNetConnection connection,
+            CharacterMovementMessageType messageType,
+            byte[] packet)
+        {
+            if (Mode == NetworkProcessMode.DedicatedServer)
+            {
+                HandleServerCharacterMove(connection, messageType, packet);
+                return;
+            }
+
+            switch (messageType)
+            {
+                case CharacterMovementMessageType.ServerMoveAck:
+                    HandleClientMoveAck(connection, packet);
+                    break;
+
+                case CharacterMovementMessageType.TransformSnapshot:
+                    HandleClientTransformSnapshot(connection, packet);
+                    break;
+
+                default:
+                    CloseConnection(connection, $"Server sent unexpected {messageType}");
+                    break;
+            }
+        }
+
+        private void HandleServerCharacterMove(
+            GameNetConnection connection,
+            CharacterMovementMessageType messageType,
+            byte[] packet)
+        {
+            if (messageType != CharacterMovementMessageType.ClientMove
+                || !CharacterMovementProtocol.TryReadClientMove(packet, out CharacterMoveMessage move)
+                || !objectRegistry.TryGet(move.NetId, out NetworkIdentity identity)
+                || identity.AuthorityEpoch != move.AuthorityEpoch
+                || identity.OwnerConnectionId != connection.ConnectionId
+                || !connection.TryGetActorChannelByNetId(move.NetId, out ActorReplicationChannel channel)
+                || !channel.SpawnAcked)
+            {
+                RejectOrClose(
+                    connection,
+                    ConnectionRejectReason.InvalidPacket,
+                    "Invalid or unauthorized ClientMove");
+                return;
+            }
+
+            CharacterNetworkMovement networkMovement
+                = identity.GetComponent<CharacterNetworkMovement>();
+            string validationError = null;
+            if (networkMovement == null
+                || !networkMovement.TryProcessServerMove(move, out validationError))
+            {
+                RejectOrClose(
+                    connection,
+                    ConnectionRejectReason.InvalidPacket,
+                    validationError ?? "Target has no CharacterNetworkMovement");
+                return;
+            }
+
+            CharacterMoveAckMessage ack = networkMovement.CreateServerAck(serverTick);
+            byte[] ackPacket = CharacterMovementProtocol.CreateServerMoveAck(
+                ack.NetId,
+                ack.AuthorityEpoch,
+                ack.AcknowledgedSequence,
+                ack.ServerTick,
+                ack.Position,
+                ack.Rotation,
+                ack.Velocity,
+                ack.MovementMode);
+            SendUnreliable(connection, ackPacket);
+        }
+
+        private void HandleClientMoveAck(GameNetConnection connection, byte[] packet)
+        {
+            if (!CharacterMovementProtocol.TryReadServerMoveAck(
+                    packet,
+                    out CharacterMoveAckMessage ack)
+                || !objectRegistry.TryGet(ack.NetId, out NetworkIdentity identity)
+                || identity.Role != NetworkRole.AutonomousProxy
+                || identity.AuthorityEpoch != ack.AuthorityEpoch)
+            {
+                CloseConnection(connection, "Invalid ServerMoveAck");
+                return;
+            }
+
+            SynchronizeClientServerTick(ack.ServerTick);
+            CharacterNetworkMovement networkMovement
+                = identity.GetComponent<CharacterNetworkMovement>();
+            if (networkMovement == null)
+            {
+                CloseConnection(connection, "Autonomous character has no CharacterNetworkMovement");
+                return;
+            }
+
+            networkMovement.ReceiveServerMoveAck(ack);
+        }
+
+        private void HandleClientTransformSnapshot(GameNetConnection connection, byte[] packet)
+        {
+            if (!CharacterMovementProtocol.TryReadTransformSnapshot(
+                    packet,
+                    out CharacterSnapshotMessage snapshot)
+                || !objectRegistry.TryGet(snapshot.NetId, out NetworkIdentity identity)
+                || identity.Role != NetworkRole.SimulatedProxy
+                || identity.AuthorityEpoch != snapshot.AuthorityEpoch)
+            {
+                CloseConnection(connection, "Invalid TransformSnapshot");
+                return;
+            }
+
+            SynchronizeClientServerTick(snapshot.ServerTick);
+            CharacterNetworkMovement networkMovement
+                = identity.GetComponent<CharacterNetworkMovement>();
+            if (networkMovement == null)
+            {
+                CloseConnection(connection, "Simulated character has no CharacterNetworkMovement");
+                return;
+            }
+
+            networkMovement.ReceiveSnapshot(snapshot);
+        }
+
         private void HandleActorChannelClose(GameNetConnection connection, byte[] packet)
         {
             if (!ActorProtocol.TryReadActorChannelClose(
@@ -695,6 +919,153 @@ namespace RPGDemo.GameFramework.Networking
                 $"[Net][DS] Opening ActorChannel {channel.ChannelId} for NetId={identity.NetId} "
                 + $"to connection {connection.ConnectionId}.");
             return true;
+        }
+
+        private void SendInitialObjectStates(
+            GameNetConnection connection,
+            ActorReplicationChannel channel)
+        {
+            if (connection == null || channel == null || !channel.SpawnAcked || channel.Actor == null)
+            {
+                return;
+            }
+
+            foreach (ObjectReplicator replicator in channel.ObjectReplicators)
+            {
+                if (!replicator.TryCaptureState(
+                        force: true,
+                        out ushort sequence,
+                        out byte[] state))
+                {
+                    continue;
+                }
+
+                byte[] packet = ObjectReplicationProtocol.CreateObjectState(
+                    channel.ChannelId,
+                    channel.NetId,
+                    channel.Actor.AuthorityEpoch,
+                    replicator.ReplicationId,
+                    sequence,
+                    ObjectStateFlags.Initial,
+                    state);
+                if (!TrySendReliable(connection, packet, "InitialObjectState"))
+                {
+                    return;
+                }
+
+                Debug.Log(
+                    $"[Net][DS] Initial state sent: connection={connection.ConnectionId}, "
+                    + $"NetId={channel.NetId}, ReplicationId={replicator.ReplicationId}.");
+            }
+
+            channel.LastReplicatedTick = serverTick;
+        }
+
+        private void ReplicateActorStates()
+        {
+            if (Mode != NetworkProcessMode.DedicatedServer
+                || serverTick == 0
+                || DefaultStateReplicationRate == 0)
+            {
+                return;
+            }
+
+            uint replicationInterval = Math.Max(
+                1u,
+                (uint)DefaultTickRate / DefaultStateReplicationRate);
+            List<GameNetConnection> readyConnections = GetReadyConnections();
+            for (int connectionIndex = 0; connectionIndex < readyConnections.Count; connectionIndex++)
+            {
+                GameNetConnection connection = readyConnections[connectionIndex];
+                List<ActorReplicationChannel> channels
+                    = new List<ActorReplicationChannel>(connection.ActorChannels);
+                for (int channelIndex = 0; channelIndex < channels.Count; channelIndex++)
+                {
+                    ActorReplicationChannel channel = channels[channelIndex];
+                    if (channel == null
+                        || !channel.SpawnAcked
+                        || channel.Actor == null
+                        || serverTick - channel.LastReplicatedTick < replicationInterval)
+                    {
+                        continue;
+                    }
+
+                    channel.LastReplicatedTick = serverTick;
+                    foreach (ObjectReplicator replicator in channel.ObjectReplicators)
+                    {
+                        if (!replicator.TryCaptureState(
+                                force: false,
+                                out ushort sequence,
+                                out byte[] state))
+                        {
+                            continue;
+                        }
+
+                        byte[] packet = ObjectReplicationProtocol.CreateObjectState(
+                            channel.ChannelId,
+                            channel.NetId,
+                            channel.Actor.AuthorityEpoch,
+                            replicator.ReplicationId,
+                            sequence,
+                            ObjectStateFlags.None,
+                            state);
+                        SendUnreliable(connection, packet);
+                    }
+                }
+            }
+        }
+
+        private void ReplicateCharacterSnapshots()
+        {
+            if (Mode != NetworkProcessMode.DedicatedServer
+                || serverTick == 0
+                || DefaultMovementSnapshotRate == 0)
+            {
+                return;
+            }
+
+            uint snapshotInterval = Math.Max(
+                1u,
+                (uint)DefaultTickRate / DefaultMovementSnapshotRate);
+            List<GameNetConnection> readyConnections = GetReadyConnections();
+            for (int connectionIndex = 0; connectionIndex < readyConnections.Count; connectionIndex++)
+            {
+                GameNetConnection connection = readyConnections[connectionIndex];
+                List<ActorReplicationChannel> channels
+                    = new List<ActorReplicationChannel>(connection.ActorChannels);
+                for (int channelIndex = 0; channelIndex < channels.Count; channelIndex++)
+                {
+                    ActorReplicationChannel channel = channels[channelIndex];
+                    if (channel == null
+                        || !channel.SpawnAcked
+                        || channel.Actor == null
+                        || channel.Actor.OwnerConnectionId == connection.ConnectionId
+                        || serverTick - channel.LastMovementReplicatedTick < snapshotInterval)
+                    {
+                        continue;
+                    }
+
+                    CharacterNetworkMovement networkMovement
+                        = channel.Actor.GetComponent<CharacterNetworkMovement>();
+                    if (networkMovement == null)
+                    {
+                        continue;
+                    }
+
+                    channel.LastMovementReplicatedTick = serverTick;
+                    CharacterSnapshotMessage snapshot
+                        = networkMovement.CreateServerSnapshot(serverTick);
+                    byte[] packet = CharacterMovementProtocol.CreateTransformSnapshot(
+                        snapshot.NetId,
+                        snapshot.AuthorityEpoch,
+                        snapshot.ServerTick,
+                        snapshot.Position,
+                        snapshot.Rotation,
+                        snapshot.Velocity,
+                        snapshot.MovementMode);
+                    SendUnreliable(connection, packet);
+                }
+            }
         }
 
         private void HandleTransportDisconnected(TransportConnectionHandle handle, string reason)
@@ -792,6 +1163,14 @@ namespace RPGDemo.GameFramework.Networking
                 TransportDelivery.Reliable);
         }
 
+        private bool SendUnreliable(GameNetConnection connection, byte[] packet)
+        {
+            return transport.Send(
+                connection.TransportHandle,
+                new ArraySegment<byte>(packet),
+                TransportDelivery.Unreliable);
+        }
+
         private bool TrySendReliable(GameNetConnection connection, byte[] packet, string packetName)
         {
             if (SendReliable(connection, packet))
@@ -805,12 +1184,22 @@ namespace RPGDemo.GameFramework.Networking
 
         private void AdvanceServerClock(float deltaTime)
         {
-            if (Mode != NetworkProcessMode.DedicatedServer || deltaTime <= 0f)
+            if (deltaTime <= 0f)
             {
                 return;
             }
 
-            double tickInterval = 1d / DefaultTickRate;
+            ushort tickRate = Mode == NetworkProcessMode.DedicatedServer
+                ? DefaultTickRate
+                : ServerConnection != null && ServerConnection.IsReady
+                    ? ServerConnection.ServerTickRate
+                    : (ushort)0;
+            if (tickRate == 0)
+            {
+                return;
+            }
+
+            double tickInterval = 1d / tickRate;
             serverTickAccumulator += deltaTime;
             uint elapsedTicks = (uint)(serverTickAccumulator / tickInterval);
             if (elapsedTicks == 0)
@@ -820,6 +1209,15 @@ namespace RPGDemo.GameFramework.Networking
 
             serverTick += elapsedTicks;
             serverTickAccumulator -= elapsedTicks * tickInterval;
+        }
+
+        private void SynchronizeClientServerTick(uint receivedServerTick)
+        {
+            if (Mode == NetworkProcessMode.Client
+                && (serverTick == 0 || unchecked(receivedServerTick - serverTick) < 0x80000000u))
+            {
+                serverTick = Math.Max(serverTick, receivedServerTick);
+            }
         }
 
         private void CleanupNetworkStateForConnection(GameNetConnection connection)

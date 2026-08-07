@@ -26,6 +26,7 @@ namespace RPGDemo.GameFramework
             if (Pawn == inPawn && Pawn != null)
             {
                 InitInputSystem();
+                ActivatePlayerInput();
                 Pawn.InitializePlayerInputComponent();
                 ChangeState(ControllerStates.Playing);
             }
@@ -33,6 +34,11 @@ namespace RPGDemo.GameFramework
 
         protected override void OnUnPossess()
         {
+            if (playerInput != null)
+            {
+                playerInput.DeactivateInput();
+            }
+
             base.OnUnPossess();
             rotationInput = Vector3.zero;
             ChangeState(ControllerStates.Inactive);
@@ -74,6 +80,32 @@ namespace RPGDemo.GameFramework
             {
                 inputComponent = gameObject.AddComponent<InputComponent>();
             }
+        }
+
+        private void ActivatePlayerInput()
+        {
+            if (playerInput == null || playerInput.actions == null)
+            {
+                return;
+            }
+
+            playerInput.ActivateInput();
+            UnityEngine.InputSystem.InputActionMap defaultMap
+                = string.IsNullOrWhiteSpace(playerInput.defaultActionMap)
+                    ? null
+                    : playerInput.actions.FindActionMap(playerInput.defaultActionMap, false);
+            if (defaultMap != null && playerInput.currentActionMap != defaultMap)
+            {
+                playerInput.SwitchCurrentActionMap(playerInput.defaultActionMap);
+            }
+
+            defaultMap?.Enable();
+            UnityEngine.InputSystem.InputAction moveAction
+                = playerInput.actions.FindAction("Player/Move", false);
+            Debug.Log(
+                $"[Input] PlayerInput activated; map={playerInput.currentActionMap?.name ?? "None"}, "
+                + $"MoveEnabled={moveAction != null && moveAction.enabled}.",
+                this);
         }
 
         protected virtual void PlayerTick(float deltaTime)

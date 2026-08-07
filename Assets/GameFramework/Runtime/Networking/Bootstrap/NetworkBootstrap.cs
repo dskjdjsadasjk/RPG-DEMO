@@ -1,4 +1,5 @@
 using System;
+using RPGDemo.GameFramework.Networking.Client;
 using RPGDemo.GameFramework.Networking.Identity;
 using RPGDemo.GameFramework.Networking.Server;
 using UnityEngine;
@@ -21,6 +22,7 @@ namespace RPGDemo.GameFramework.Networking.Bootstrap
 
         private GameNetDriver netDriver;
         private ServerGameMode serverGameMode;
+        private ClientPlayerSession clientPlayerSession;
 
         public static NetworkBootstrap Instance => instance;
         public GameNetDriver NetDriver => netDriver;
@@ -79,6 +81,7 @@ namespace RPGDemo.GameFramework.Networking.Bootstrap
 
             instance = this;
             DontDestroyOnLoad(gameObject);
+            Application.runInBackground = true;
 
             bool commandLineWillStart = false;
             try
@@ -105,6 +108,8 @@ namespace RPGDemo.GameFramework.Networking.Bootstrap
 
         private void OnDestroy()
         {
+            clientPlayerSession?.Dispose();
+            clientPlayerSession = null;
             serverGameMode?.Dispose();
             serverGameMode = null;
             netDriver?.Dispose();
@@ -125,6 +130,8 @@ namespace RPGDemo.GameFramework.Networking.Bootstrap
 
             serverGameMode?.Dispose();
             serverGameMode = null;
+            clientPlayerSession?.Dispose();
+            clientPlayerSession = null;
             netDriver?.Dispose();
             NetworkPrefabRegistry resolvedPrefabRegistry = prefabRegistry != null
                 ? prefabRegistry
@@ -151,6 +158,7 @@ namespace RPGDemo.GameFramework.Networking.Bootstrap
                 else if (mode == NetworkProcessMode.Client)
                 {
                     netDriver.StartClient(address, (ushort)port, displayName);
+                    clientPlayerSession = new ClientPlayerSession(netDriver);
                 }
             }
             catch (Exception exception)
@@ -158,6 +166,8 @@ namespace RPGDemo.GameFramework.Networking.Bootstrap
                 Debug.LogError($"[Net][Bootstrap] Startup failed: {exception}");
                 serverGameMode?.Dispose();
                 serverGameMode = null;
+                clientPlayerSession?.Dispose();
+                clientPlayerSession = null;
                 netDriver.Dispose();
                 netDriver = null;
             }
@@ -165,6 +175,8 @@ namespace RPGDemo.GameFramework.Networking.Bootstrap
 
         public void StopNetwork()
         {
+            clientPlayerSession?.Dispose();
+            clientPlayerSession = null;
             serverGameMode?.Dispose();
             serverGameMode = null;
             netDriver?.Stop();

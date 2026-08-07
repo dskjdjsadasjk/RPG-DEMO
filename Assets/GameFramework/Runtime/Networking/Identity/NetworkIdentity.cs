@@ -1,4 +1,5 @@
 using System;
+using RPGDemo.GameFramework.Networking.Replication;
 using UnityEngine;
 
 namespace RPGDemo.GameFramework.Networking.Identity
@@ -67,6 +68,12 @@ namespace RPGDemo.GameFramework.Networking.Identity
 
         internal void NotifyNetworkSpawned()
         {
+            NetworkBehaviour[] behaviours = GetComponentsInChildren<NetworkBehaviour>(true);
+            for (int i = 0; i < behaviours.Length; i++)
+            {
+                behaviours[i].NotifyNetworkSpawned(this);
+            }
+
             NetworkSpawned?.Invoke(this);
         }
 
@@ -75,6 +82,12 @@ namespace RPGDemo.GameFramework.Networking.Identity
             if (!IsSpawned)
             {
                 return;
+            }
+
+            NetworkBehaviour[] behaviours = GetComponentsInChildren<NetworkBehaviour>(true);
+            for (int i = 0; i < behaviours.Length; i++)
+            {
+                behaviours[i].NotifyNetworkDespawned();
             }
 
             IsSpawned = false;

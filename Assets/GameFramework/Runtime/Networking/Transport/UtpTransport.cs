@@ -127,9 +127,19 @@ namespace RPGDemo.GameFramework.Networking.Transport
                             break;
 
                         case NetworkEvent.Type.Disconnect:
-                            string reason = reader.Length > 0
-                                ? $"UTP disconnect reason {reader.ReadByte()}"
-                                : "Remote closed the connection";
+                            string reason;
+                            if (reader.Length > 0)
+                            {
+                                byte rawReason = reader.ReadByte();
+                                Unity.Networking.Transport.Error.DisconnectReason disconnectReason
+                                    = (Unity.Networking.Transport.Error.DisconnectReason)rawReason;
+                                reason = $"UTP {disconnectReason} ({rawReason})";
+                            }
+                            else
+                            {
+                                reason = "Remote closed the connection";
+                            }
+
                             output.Add(new TransportEvent(TransportEventType.Disconnected, handle, reason: reason));
                             disconnectedIds.Add(id);
                             break;
