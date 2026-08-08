@@ -40,6 +40,11 @@ namespace RPGDemo.GameFramework
         private Vector3 acceleration;
         private Vector3 velocity;
         private float analogInputModifier;
+        private Vector3 lastRequestedDisplacement;
+        private Vector3 lastMovementDelta;
+        private CollisionFlags lastCollisionFlags;
+        private bool lastMoveAttempted;
+        private string lastSimulationBlockReason = "NotTicked";
 
         public Character CharacterOwner => characterOwner;
         public UnityEngine.CharacterController UpdatedComponent => updatedComponent;
@@ -47,18 +52,21 @@ namespace RPGDemo.GameFramework
         public Vector3 Acceleration => acceleration;
         public Vector3 Velocity => velocity;
         public float AnalogInputModifier => analogInputModifier;
+        public Vector3 LastRequestedDisplacement => lastRequestedDisplacement;
+        public Vector3 LastMovementDelta => lastMovementDelta;
+        public CollisionFlags LastCollisionFlags => lastCollisionFlags;
+        public bool LastMoveAttempted => lastMoveAttempted;
+        public string LastSimulationBlockReason => lastSimulationBlockReason;
 
         public void SimulateNetworkMove(Vector3 worldInput, float deltaTime)
         {
-            if (!HasValidData()
-                || characterOwner == null
-                || updatedComponent == null
-                || !updatedComponent.enabled
-                || deltaTime < MinTickTime)
+            if (!CanSimulate(deltaTime, out string blockReason))
             {
+                RecordBlockedSimulation(blockReason);
                 return;
             }
 
+            lastSimulationBlockReason = "None";
             ControlledCharacterMove(Vector3.ClampMagnitude(worldInput, 1f), deltaTime);
         }
 
@@ -68,7 +76,22 @@ namespace RPGDemo.GameFramework
             Vector3 authoritativeVelocity,
             MovementMode authoritativeMovementMode)
         {
+            // CharacterController keeps an internal native position. A direct Transform
+            // teleport followed immediately by prediction replay can make Move() operate
+            // from the stale internal position and produce an enormous displacement.
+            bool controllerWasEnabled = updatedComponent != null && updatedComponent.enabled;
+            if (controllerWasEnabled)
+            {
+                updatedComponent.enabled = false;
+            }
+
             transform.SetPositionAndRotation(position, rotation);
+
+            if (controllerWasEnabled)
+            {
+                updatedComponent.enabled = true;
+            }
+
             velocity = authoritativeVelocity;
             acceleration = Vector3.zero;
             analogInputModifier = 0f;
@@ -80,21 +103,25 @@ namespace RPGDemo.GameFramework
             base.Awake();
             characterOwner = PawnOwner as Character;
             updatedComponent = GetComponent<UnityEngine.CharacterController>();
+            if (updatedComponent != null)
+            {
+                // Network prediction can simulate sub-millimetre steps at high frame rates.
+                // Dropping those steps would also zero the velocity derived from actual motion.
+                updatedComponent.minMoveDistance = 0f;
+            }
         }
 
         protected override void TickComponent(float deltaTime)
         {
             Vector3 inputVector = ConsumeInputVector();
 
-            if (!HasValidData()
-                || characterOwner == null
-                || updatedComponent == null
-                || !updatedComponent.enabled
-                || deltaTime < MinTickTime)
+            if (!CanSimulate(deltaTime, out string blockReason))
             {
+                RecordBlockedSimulation(blockReason);
                 return;
             }
 
+            lastSimulationBlockReason = "None";
             ControlledCharacterMove(inputVector, deltaTime);
         }
 
@@ -140,9 +167,14 @@ namespace RPGDemo.GameFramework
         {
             if (movementMode == MovementMode.None)
             {
+                RecordBlockedSimulation("MovementModeNone");
                 return;
             }
 
+            lastMoveAttempted = false;
+            lastRequestedDisplacement = Vector3.zero;
+            lastMovementDelta = Vector3.zero;
+            lastCollisionFlags = CollisionFlags.None;
             StartNewPhysics(deltaTime);
         }
 
@@ -170,6 +202,7 @@ namespace RPGDemo.GameFramework
             {
                 acceleration = Vector3.zero;
                 velocity = Vector3.zero;
+                RecordBlockedSimulation("NoController");
                 return;
             }
 
@@ -182,9 +215,12 @@ namespace RPGDemo.GameFramework
                 brakingDecelerationWalking);
 
             Vector3 oldLocation = transform.position;
-            updatedComponent.Move(velocity * deltaTime);
+            lastRequestedDisplacement = velocity * deltaTime;
+            lastMoveAttempted = true;
+            lastCollisionFlags = updatedComponent.Move(lastRequestedDisplacement);
+            lastMovementDelta = transform.position - oldLocation;
 
-            Vector3 actualVelocity = (transform.position - oldLocation) / deltaTime;
+            Vector3 actualVelocity = lastMovementDelta / deltaTime;
             velocity = Vector3.ProjectOnPlane(actualVelocity, Vector3.up);
         }
 
@@ -300,6 +336,51 @@ namespace RPGDemo.GameFramework
         {
             maxSpeed = Mathf.Max(0f, maxSpeed);
             return velocity.sqrMagnitude > maxSpeed * maxSpeed;
+        }
+
+        private bool CanSimulate(float deltaTime, out string blockReason)
+        {
+            if (!HasValidData())
+            {
+                blockReason = "NoPawnOwner";
+                return false;
+            }
+
+            if (characterOwner == null)
+            {
+                blockReason = "NoCharacterOwner";
+                return false;
+            }
+
+            if (updatedComponent == null)
+            {
+                blockReason = "NoCharacterController";
+                return false;
+            }
+
+            if (!updatedComponent.enabled)
+            {
+                blockReason = "CharacterControllerDisabled";
+                return false;
+            }
+
+            if (deltaTime < MinTickTime)
+            {
+                blockReason = "DeltaTimeTooSmall";
+                return false;
+            }
+
+            blockReason = "None";
+            return true;
+        }
+
+        private void RecordBlockedSimulation(string blockReason)
+        {
+            lastSimulationBlockReason = blockReason;
+            lastMoveAttempted = false;
+            lastRequestedDisplacement = Vector3.zero;
+            lastMovementDelta = Vector3.zero;
+            lastCollisionFlags = CollisionFlags.None;
         }
     }
 }

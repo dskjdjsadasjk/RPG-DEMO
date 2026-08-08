@@ -31,16 +31,27 @@ namespace RPGDemo.GameFramework.Networking.Replication
         private uint lastAckedMoveSequence;
         private uint lastSnapshotTick;
         private int correctionCount;
+        private int sentMovesInWindow;
+        private int receivedAcksInWindow;
+        private int correctionsInWindow;
+        private int processedServerMovesInWindow;
+        private float clientDiagnosticWindowStart;
+        private float serverDiagnosticWindowStart;
+        private float lastPositionError;
+        private Vector3 lastAckPosition;
         private bool loggedServerMove;
         private bool loggedServerNonZeroMove;
         private bool loggedOwnerAck;
         private bool loggedSnapshot;
         private bool loggedLocalInput;
+        private bool loggedExtremeCorrection;
 
         public uint LastAckedMoveSequence => lastAckedMoveSequence;
         public int PendingMoveCount => savedMoves.Count;
         public int BufferedSnapshotCount => snapshots.Count;
         public int CorrectionCount => correctionCount;
+        public float LastPositionError => lastPositionError;
+        public Vector3 LastAckPosition => lastAckPosition;
 
         private void Awake()
         {
@@ -124,6 +135,8 @@ namespace RPGDemo.GameFramework.Networking.Replication
 
             movement.SimulateNetworkMove(move.WorldInput, move.DeltaTime);
             lastServerMoveSequence = move.Sequence;
+            processedServerMovesInWindow++;
+            LogServerDiagnosticsIfDue(move.WorldInput);
             if (!loggedServerMove)
             {
                 loggedServerMove = true;
@@ -159,6 +172,8 @@ namespace RPGDemo.GameFramework.Networking.Replication
             }
 
             lastAckedMoveSequence = ack.AcknowledgedSequence;
+            receivedAcksInWindow++;
+            lastAckPosition = ack.Position;
             if (!loggedOwnerAck)
             {
                 loggedOwnerAck = true;
@@ -172,10 +187,12 @@ namespace RPGDemo.GameFramework.Networking.Replication
             float positionError = acknowledgedIndex >= 0
                 ? Vector3.Distance(savedMoves[acknowledgedIndex].PredictedPosition, ack.Position)
                 : Vector3.Distance(transform.position, ack.Position);
+            lastPositionError = positionError;
 
             RemoveAcknowledgedMoves(ack.AcknowledgedSequence);
             if (positionError <= OwnerCorrectionDistance)
             {
+                LogClientDiagnosticsIfDue();
                 return;
             }
 
@@ -184,17 +201,36 @@ namespace RPGDemo.GameFramework.Networking.Replication
                 ack.Rotation,
                 ack.Velocity,
                 ack.MovementMode);
+            Vector3 positionAfterApply = transform.position;
 
             for (int i = 0; i < savedMoves.Count; i++)
             {
                 SavedMove savedMove = savedMoves[i];
+                Vector3 positionBeforeReplay = transform.position;
                 movement.SimulateNetworkMove(savedMove.WorldInput, savedMove.DeltaTime);
+                if (!loggedExtremeCorrection && IsExtremePosition(transform.position))
+                {
+                    loggedExtremeCorrection = true;
+                    Debug.LogError(
+                        $"[Net][MoveDiag][Extreme] NetId={identity.NetId}, "
+                        + $"ackSequence={ack.AcknowledgedSequence}, ackPosition={ack.Position}, "
+                        + $"positionAfterApply={positionAfterApply}, "
+                        + $"replayIndex={i}/{savedMoves.Count}, "
+                        + $"replaySequence={savedMove.Sequence}, replayDt={savedMove.DeltaTime:F6}, "
+                        + $"replayInput={savedMove.WorldInput}, "
+                        + $"positionBeforeReplay={positionBeforeReplay}, "
+                        + $"positionAfterReplay={transform.position}, velocity={movement.Velocity}.",
+                        identity);
+                }
+
                 savedMove.PredictedPosition = transform.position;
                 savedMove.PredictedRotation = transform.rotation;
                 savedMove.PredictedVelocity = movement.Velocity;
             }
 
             correctionCount++;
+            correctionsInWindow++;
+            LogClientDiagnosticsIfDue();
         }
 
         public void ReceiveSnapshot(CharacterSnapshotMessage snapshot)
@@ -275,11 +311,20 @@ namespace RPGDemo.GameFramework.Networking.Replication
             lastSnapshotTick = 0;
             nextMoveSequence = 1;
             clientTick = 0;
+            sentMovesInWindow = 0;
+            receivedAcksInWindow = 0;
+            correctionsInWindow = 0;
+            processedServerMovesInWindow = 0;
+            clientDiagnosticWindowStart = Time.unscaledTime;
+            serverDiagnosticWindowStart = Time.unscaledTime;
+            lastPositionError = 0f;
+            lastAckPosition = Vector3.zero;
             loggedServerMove = false;
             loggedServerNonZeroMove = false;
             loggedOwnerAck = false;
             loggedSnapshot = false;
             loggedLocalInput = false;
+            loggedExtremeCorrection = false;
 
             if (movement != null)
             {
@@ -336,13 +381,86 @@ namespace RPGDemo.GameFramework.Networking.Replication
                 savedMoves.RemoveAt(0);
             }
 
-            driver.SendCharacterMove(
+            if (driver.SendCharacterMove(
                 identity,
                 sequence,
                 clientTick,
                 deltaTime,
                 worldInput,
-                controlYaw);
+                controlYaw))
+            {
+                sentMovesInWindow++;
+            }
+
+            LogClientDiagnosticsIfDue();
+        }
+
+        private void LogClientDiagnosticsIfDue()
+        {
+            float now = Time.unscaledTime;
+            float elapsed = now - clientDiagnosticWindowStart;
+            if (elapsed < 1f || identity == null || identity.Role != NetworkRole.AutonomousProxy)
+            {
+                return;
+            }
+
+            Debug.Log(
+                $"[Net][MoveDiag][Client] NetId={identity.NetId}, "
+                + $"fps={1f / Mathf.Max(Time.unscaledDeltaTime, 0.000001f):F0}, "
+                + $"sent/s={sentMovesInWindow / elapsed:F1}, "
+                + $"ack/s={receivedAcksInWindow / elapsed:F1}, "
+                + $"corrections/s={correctionsInWindow / elapsed:F1}, "
+                + $"input={movement.GetLastInputVector()}, velocity={movement.Velocity}, "
+                + $"mode={movement.CurrentMovementMode}, block={movement.LastSimulationBlockReason}, "
+                + $"attempted={movement.LastMoveAttempted}, request={movement.LastRequestedDisplacement}, "
+                + $"moved={movement.LastMovementDelta}, collision={movement.LastCollisionFlags}, "
+                + $"position={transform.position}, ackPosition={lastAckPosition}, "
+                + $"error={lastPositionError:F4}, pending={savedMoves.Count}.",
+                identity);
+
+            sentMovesInWindow = 0;
+            receivedAcksInWindow = 0;
+            correctionsInWindow = 0;
+            clientDiagnosticWindowStart = now;
+        }
+
+        private void LogServerDiagnosticsIfDue(Vector3 latestInput)
+        {
+            float now = Time.unscaledTime;
+            float elapsed = now - serverDiagnosticWindowStart;
+            if (elapsed < 1f || identity == null || identity.Role != NetworkRole.Authority)
+            {
+                return;
+            }
+
+            Debug.Log(
+                $"[Net][MoveDiag][DS] NetId={identity.NetId}, "
+                + $"processed/s={processedServerMovesInWindow / elapsed:F1}, "
+                + $"input={latestInput}, velocity={movement.Velocity}, "
+                + $"mode={movement.CurrentMovementMode}, block={movement.LastSimulationBlockReason}, "
+                + $"attempted={movement.LastMoveAttempted}, request={movement.LastRequestedDisplacement}, "
+                + $"moved={movement.LastMovementDelta}, collision={movement.LastCollisionFlags}, "
+                + $"position={transform.position}, sequence={lastServerMoveSequence}.",
+                identity);
+
+            processedServerMovesInWindow = 0;
+            serverDiagnosticWindowStart = now;
+        }
+
+        private static bool IsExtremePosition(Vector3 position)
+        {
+            const float diagnosticThreshold = 100000f;
+            return !IsFinite(position.x)
+                || !IsFinite(position.y)
+                || !IsFinite(position.z)
+                || Mathf.Abs(position.x) > diagnosticThreshold
+                || Mathf.Abs(position.y) > diagnosticThreshold
+                || Mathf.Abs(position.z) > diagnosticThreshold;
+        }
+
+        private static bool IsFinite(float value)
+        {
+            return !float.IsNaN(value) && !float.IsInfinity(value);
         }
 
         private void InterpolateSimulatedProxy()
