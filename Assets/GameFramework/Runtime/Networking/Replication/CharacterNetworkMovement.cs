@@ -12,13 +12,20 @@ namespace RPGDemo.GameFramework.Networking.Replication
     [RequireComponent(typeof(CharacterMovementComponent))]
     public sealed class CharacterNetworkMovement : MonoBehaviour
     {
-        private const float MaxMoveDeltaTime = 0.1f;
+        public const ushort MovementTickRate = GameNetDriver.DefaultTickRate;
+        public const float FixedMoveDeltaTime = 1f / MovementTickRate;
+
+        private const float FixedMoveDeltaTimeTolerance = 0.0001f;
         private const float OwnerCorrectionDistance = 0.05f;
         private const int MaxSavedMoves = 256;
+        private const int MaxPendingServerMoves = 256;
+        private const int MaxCatchUpTicksPerFrame = 8;
         private const int MaxSnapshots = 32;
         private const uint InterpolationDelayTicks = 6;
 
         private readonly List<SavedMove> savedMoves = new List<SavedMove>(64);
+        private readonly Queue<CharacterMoveMessage> pendingServerMoves
+            = new Queue<CharacterMoveMessage>(64);
         private readonly List<CharacterSnapshotMessage> snapshots
             = new List<CharacterSnapshotMessage>(MaxSnapshots);
 
@@ -27,6 +34,7 @@ namespace RPGDemo.GameFramework.Networking.Replication
         private NetworkRole configuredRole = NetworkRole.None;
         private uint nextMoveSequence = 1;
         private uint clientTick;
+        private uint lastQueuedServerMoveSequence;
         private uint lastServerMoveSequence;
         private uint lastAckedMoveSequence;
         private uint lastSnapshotTick;
@@ -39,6 +47,8 @@ namespace RPGDemo.GameFramework.Networking.Replication
         private float serverDiagnosticWindowStart;
         private float lastPositionError;
         private Vector3 lastAckPosition;
+        private Vector3 latestLocalInput;
+        private double clientMoveAccumulator;
         private bool loggedServerMove;
         private bool loggedServerNonZeroMove;
         private bool loggedOwnerAck;
@@ -48,6 +58,7 @@ namespace RPGDemo.GameFramework.Networking.Replication
 
         public uint LastAckedMoveSequence => lastAckedMoveSequence;
         public int PendingMoveCount => savedMoves.Count;
+        public int PendingServerMoveCount => pendingServerMoves.Count;
         public int BufferedSnapshotCount => snapshots.Count;
         public int CorrectionCount => correctionCount;
         public float LastPositionError => lastPositionError;
@@ -74,7 +85,7 @@ namespace RPGDemo.GameFramework.Networking.Replication
 
             if (identity.Role == NetworkRole.AutonomousProxy)
             {
-                CaptureAndSendLocalMove();
+                TickAutonomousProxy();
             }
             else if (identity.Role == NetworkRole.SimulatedProxy)
             {
@@ -91,10 +102,11 @@ namespace RPGDemo.GameFramework.Networking.Replication
 
             configuredRole = NetworkRole.None;
             savedMoves.Clear();
+            pendingServerMoves.Clear();
             snapshots.Clear();
         }
 
-        public bool TryProcessServerMove(
+        public bool TryQueueServerMove(
             CharacterMoveMessage move,
             out string validationError)
         {
@@ -109,9 +121,16 @@ namespace RPGDemo.GameFramework.Networking.Replication
                 return false;
             }
 
-            if (move.DeltaTime <= 0f || move.DeltaTime > MaxMoveDeltaTime)
+            if (Mathf.Abs(move.DeltaTime - FixedMoveDeltaTime) > FixedMoveDeltaTimeTolerance)
             {
-                validationError = $"Move DeltaTime {move.DeltaTime:F4} is outside the allowed range";
+                validationError = $"Move DeltaTime {move.DeltaTime:F6} does not match fixed step "
+                    + $"{FixedMoveDeltaTime:F6}";
+                return false;
+            }
+
+            if (move.ClientTick == 0)
+            {
+                validationError = "Move ClientTick must be non-zero";
                 return false;
             }
 
@@ -121,9 +140,41 @@ namespace RPGDemo.GameFramework.Networking.Replication
                 return false;
             }
 
-            if (!IsNewerSequence(move.Sequence, lastServerMoveSequence))
+            if (!IsNewerSequence(move.Sequence, lastQueuedServerMoveSequence))
             {
                 return true;
+            }
+
+            if (pendingServerMoves.Count >= MaxPendingServerMoves)
+            {
+                validationError = $"Server move queue exceeded {MaxPendingServerMoves} entries";
+                return false;
+            }
+
+            pendingServerMoves.Enqueue(move);
+            lastQueuedServerMoveSequence = move.Sequence;
+            return true;
+        }
+
+        public bool TryProcessServerMovementTick(
+            uint serverTick,
+            out CharacterMoveAckMessage ack)
+        {
+            ack = default;
+            EnsureRoleConfiguration();
+            if (identity == null
+                || movement == null
+                || !identity.IsSpawned
+                || identity.Role != NetworkRole.Authority
+                || pendingServerMoves.Count == 0)
+            {
+                return false;
+            }
+
+            CharacterMoveMessage move = pendingServerMoves.Dequeue();
+            if (!IsNewerSequence(move.Sequence, lastServerMoveSequence))
+            {
+                return false;
             }
 
             Character character = movement.CharacterOwner;
@@ -133,7 +184,7 @@ namespace RPGDemo.GameFramework.Networking.Replication
                     Quaternion.Euler(0f, move.ControlYaw, 0f));
             }
 
-            movement.SimulateNetworkMove(move.WorldInput, move.DeltaTime);
+            movement.SimulateNetworkMove(move.WorldInput, FixedMoveDeltaTime);
             lastServerMoveSequence = move.Sequence;
             processedServerMovesInWindow++;
             LogServerDiagnosticsIfDue(move.WorldInput);
@@ -155,6 +206,7 @@ namespace RPGDemo.GameFramework.Networking.Replication
                     identity);
             }
 
+            ack = CreateServerAck(serverTick);
             return true;
         }
 
@@ -305,12 +357,16 @@ namespace RPGDemo.GameFramework.Networking.Replication
 
             configuredRole = role;
             savedMoves.Clear();
+            pendingServerMoves.Clear();
             snapshots.Clear();
+            lastQueuedServerMoveSequence = 0;
             lastServerMoveSequence = 0;
             lastAckedMoveSequence = 0;
             lastSnapshotTick = 0;
             nextMoveSequence = 1;
             clientTick = 0;
+            clientMoveAccumulator = 0d;
+            latestLocalInput = Vector3.zero;
             sentMovesInWindow = 0;
             receivedAcksInWindow = 0;
             correctionsInWindow = 0;
@@ -328,12 +384,11 @@ namespace RPGDemo.GameFramework.Networking.Replication
 
             if (movement != null)
             {
-                movement.AutomaticTickEnabled = role == NetworkRole.None
-                    || role == NetworkRole.AutonomousProxy;
+                movement.AutomaticTickEnabled = role == NetworkRole.None;
             }
         }
 
-        private void CaptureAndSendLocalMove()
+        private void TickAutonomousProxy()
         {
             NetworkBootstrap bootstrap = NetworkBootstrap.Instance;
             GameNetDriver driver = bootstrap != null ? bootstrap.NetDriver : null;
@@ -345,8 +400,24 @@ namespace RPGDemo.GameFramework.Networking.Replication
                 return;
             }
 
-            float deltaTime = Mathf.Clamp(Time.deltaTime, 1f / 240f, MaxMoveDeltaTime);
-            Vector3 worldInput = Vector3.ClampMagnitude(movement.GetLastInputVector(), 1f);
+            latestLocalInput = Vector3.ClampMagnitude(movement.ConsumeInputVector(), 1f);
+            double maxAccumulatedTime = FixedMoveDeltaTime * MaxCatchUpTicksPerFrame;
+            clientMoveAccumulator = System.Math.Min(
+                clientMoveAccumulator + Mathf.Max(0f, Time.unscaledDeltaTime),
+                maxAccumulatedTime);
+
+            int elapsedTicks = (int)(clientMoveAccumulator / FixedMoveDeltaTime);
+            for (int tickIndex = 0; tickIndex < elapsedTicks; tickIndex++)
+            {
+                SimulateAndSendLocalMove(driver, latestLocalInput);
+            }
+
+            clientMoveAccumulator -= elapsedTicks * FixedMoveDeltaTime;
+            LogClientDiagnosticsIfDue();
+        }
+
+        private void SimulateAndSendLocalMove(GameNetDriver driver, Vector3 worldInput)
+        {
             if (!loggedLocalInput && worldInput.sqrMagnitude > 0.0001f)
             {
                 loggedLocalInput = true;
@@ -356,6 +427,7 @@ namespace RPGDemo.GameFramework.Networking.Replication
                     identity);
             }
 
+            movement.SimulateNetworkMove(worldInput, FixedMoveDeltaTime);
             float controlYaw = movement.CharacterOwner != null
                 && movement.CharacterOwner.Controller != null
                     ? movement.CharacterOwner.Controller.ControlRotation.eulerAngles.y
@@ -369,7 +441,7 @@ namespace RPGDemo.GameFramework.Networking.Replication
             SavedMove savedMove = new SavedMove(
                 sequence,
                 ++clientTick,
-                deltaTime,
+                FixedMoveDeltaTime,
                 worldInput,
                 controlYaw,
                 transform.position,
@@ -385,14 +457,13 @@ namespace RPGDemo.GameFramework.Networking.Replication
                 identity,
                 sequence,
                 clientTick,
-                deltaTime,
+                FixedMoveDeltaTime,
                 worldInput,
                 controlYaw))
             {
                 sentMovesInWindow++;
             }
 
-            LogClientDiagnosticsIfDue();
         }
 
         private void LogClientDiagnosticsIfDue()
@@ -440,7 +511,8 @@ namespace RPGDemo.GameFramework.Networking.Replication
                 + $"mode={movement.CurrentMovementMode}, block={movement.LastSimulationBlockReason}, "
                 + $"attempted={movement.LastMoveAttempted}, request={movement.LastRequestedDisplacement}, "
                 + $"moved={movement.LastMovementDelta}, collision={movement.LastCollisionFlags}, "
-                + $"position={transform.position}, sequence={lastServerMoveSequence}.",
+                + $"position={transform.position}, sequence={lastServerMoveSequence}, "
+                + $"queued={pendingServerMoves.Count}.",
                 identity);
 
             processedServerMovesInWindow = 0;

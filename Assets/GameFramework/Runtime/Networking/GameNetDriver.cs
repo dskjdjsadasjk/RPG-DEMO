@@ -92,7 +92,12 @@ namespace RPGDemo.GameFramework.Networking
 
             float safeDeltaTime = Mathf.Max(0f, unscaledDeltaTime);
             TickHandshakeTimeouts(safeDeltaTime);
-            AdvanceServerClock(safeDeltaTime);
+            uint elapsedNetworkTicks = AdvanceServerClock(safeDeltaTime);
+            if (Mode == NetworkProcessMode.DedicatedServer && elapsedNetworkTicks > 0)
+            {
+                ProcessServerMovementTicks(elapsedNetworkTicks);
+            }
+
             ReplicateActorStates();
             ReplicateCharacterSnapshots();
             transport.Flush();
@@ -782,7 +787,7 @@ namespace RPGDemo.GameFramework.Networking
                 = identity.GetComponent<CharacterNetworkMovement>();
             string validationError = null;
             if (networkMovement == null
-                || !networkMovement.TryProcessServerMove(move, out validationError))
+                || !networkMovement.TryQueueServerMove(move, out validationError))
             {
                 RejectOrClose(
                     connection,
@@ -790,8 +795,55 @@ namespace RPGDemo.GameFramework.Networking
                     validationError ?? "Target has no CharacterNetworkMovement");
                 return;
             }
+        }
 
-            CharacterMoveAckMessage ack = networkMovement.CreateServerAck(serverTick);
+        private void ProcessServerMovementTicks(uint elapsedTicks)
+        {
+            List<GameNetConnection> readyConnections = GetReadyConnections();
+            uint firstTick = serverTick - elapsedTicks + 1u;
+            for (uint tickOffset = 0; tickOffset < elapsedTicks; tickOffset++)
+            {
+                uint simulationTick = firstTick + tickOffset;
+                for (int connectionIndex = 0;
+                     connectionIndex < readyConnections.Count;
+                     connectionIndex++)
+                {
+                    GameNetConnection connection = readyConnections[connectionIndex];
+                    List<ActorReplicationChannel> channels
+                        = new List<ActorReplicationChannel>(connection.ActorChannels);
+                    for (int channelIndex = 0; channelIndex < channels.Count; channelIndex++)
+                    {
+                        ActorReplicationChannel channel = channels[channelIndex];
+                        NetworkIdentity actor = channel != null ? channel.Actor : null;
+                        if (channel == null
+                            || !channel.SpawnAcked
+                            || actor == null
+                            || actor.Role != NetworkRole.Authority
+                            || actor.OwnerConnectionId != connection.ConnectionId)
+                        {
+                            continue;
+                        }
+
+                        CharacterNetworkMovement networkMovement
+                            = actor.GetComponent<CharacterNetworkMovement>();
+                        if (networkMovement == null
+                            || !networkMovement.TryProcessServerMovementTick(
+                                simulationTick,
+                                out CharacterMoveAckMessage ack))
+                        {
+                            continue;
+                        }
+
+                        SendServerMoveAck(connection, ack);
+                    }
+                }
+            }
+        }
+
+        private void SendServerMoveAck(
+            GameNetConnection connection,
+            CharacterMoveAckMessage ack)
+        {
             byte[] ackPacket = CharacterMovementProtocol.CreateServerMoveAck(
                 ack.NetId,
                 ack.AuthorityEpoch,
@@ -1182,11 +1234,11 @@ namespace RPGDemo.GameFramework.Networking
             return false;
         }
 
-        private void AdvanceServerClock(float deltaTime)
+        private uint AdvanceServerClock(float deltaTime)
         {
             if (deltaTime <= 0f)
             {
-                return;
+                return 0;
             }
 
             ushort tickRate = Mode == NetworkProcessMode.DedicatedServer
@@ -1196,7 +1248,7 @@ namespace RPGDemo.GameFramework.Networking
                     : (ushort)0;
             if (tickRate == 0)
             {
-                return;
+                return 0;
             }
 
             double tickInterval = 1d / tickRate;
@@ -1204,11 +1256,12 @@ namespace RPGDemo.GameFramework.Networking
             uint elapsedTicks = (uint)(serverTickAccumulator / tickInterval);
             if (elapsedTicks == 0)
             {
-                return;
+                return 0;
             }
 
             serverTick += elapsedTicks;
             serverTickAccumulator -= elapsedTicks * tickInterval;
+            return elapsedTicks;
         }
 
         private void SynchronizeClientServerTick(uint receivedServerTick)
