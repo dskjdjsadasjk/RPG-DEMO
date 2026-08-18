@@ -14,8 +14,11 @@ namespace RPGDemo.GameFramework.Networking.Replication
 
     public sealed class ActorReplicationChannel
     {
+        private const int MaxPendingReliableRpcs = 64;
         private readonly Dictionary<ushort, ObjectReplicator> replicatorsById
             = new Dictionary<ushort, ObjectReplicator>();
+        private readonly Queue<PendingRpcCall> pendingReliableRpcs
+            = new Queue<PendingRpcCall>();
 
         internal ActorReplicationChannel(
             ushort channelId,
@@ -44,6 +47,7 @@ namespace RPGDemo.GameFramework.Networking.Replication
         public ActorChannelState State { get; private set; }
         public uint LastReplicatedTick { get; internal set; }
         public uint LastMovementReplicatedTick { get; internal set; }
+        public int PendingReliableRpcCount => pendingReliableRpcs.Count;
         public IReadOnlyCollection<ObjectReplicator> ObjectReplicators => replicatorsById.Values;
 
         internal bool TryGetObjectReplicator(ushort replicationId, out ObjectReplicator replicator)
@@ -66,6 +70,41 @@ namespace RPGDemo.GameFramework.Networking.Replication
             return true;
         }
 
+        internal bool TryEnqueueReliableRpc(
+            ushort replicationId,
+            ushort functionId,
+            byte[] payload)
+        {
+            if (State != ActorChannelState.Opening
+                || SpawnAcked
+                || replicationId == 0
+                || functionId == 0
+                || payload == null
+                || payload.Length > RpcPayloadWriter.MaxPayloadBytes
+                || pendingReliableRpcs.Count >= MaxPendingReliableRpcs)
+            {
+                return false;
+            }
+
+            byte[] payloadCopy = new byte[payload.Length];
+            Buffer.BlockCopy(payload, 0, payloadCopy, 0, payload.Length);
+            pendingReliableRpcs.Enqueue(
+                new PendingRpcCall(replicationId, functionId, payloadCopy));
+            return true;
+        }
+
+        internal bool TryDequeueReliableRpc(out PendingRpcCall call)
+        {
+            if (pendingReliableRpcs.Count == 0)
+            {
+                call = default;
+                return false;
+            }
+
+            call = pendingReliableRpcs.Dequeue();
+            return true;
+        }
+
         internal void Close()
         {
             if (State == ActorChannelState.Closed)
@@ -75,6 +114,7 @@ namespace RPGDemo.GameFramework.Networking.Replication
 
             State = ActorChannelState.Closing;
             SpawnAcked = false;
+            pendingReliableRpcs.Clear();
             replicatorsById.Clear();
             State = ActorChannelState.Closed;
         }

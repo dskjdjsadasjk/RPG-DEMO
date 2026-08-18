@@ -26,8 +26,8 @@ namespace RPGDemo.GameFramework.Networking.Protocol
 
     public static class ConnectionProtocol
     {
-        public const ushort ProtocolVersion = 2;
-        public const uint SchemaHash = 0x52504734;
+        public const ushort ProtocolVersion = 3;
+        public const uint SchemaHash = 0x52504735;
         public const int MaxDisplayNameBytes = 32;
 
         public static byte[] CreateClientHello(ulong clientNonce)

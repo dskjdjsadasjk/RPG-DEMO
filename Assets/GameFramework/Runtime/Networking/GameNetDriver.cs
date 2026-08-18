@@ -132,6 +132,78 @@ namespace RPGDemo.GameFramework.Networking
             return SendUnreliable(ServerConnection, packet);
         }
 
+        internal bool SendRemoteProcedure(
+            NetworkBehaviour behaviour,
+            RpcDescriptor descriptor,
+            byte[] payload)
+        {
+            if (behaviour == null
+                || descriptor == null
+                || payload == null
+                || payload.Length > RpcPayloadWriter.MaxPayloadBytes
+                || !behaviour.IsNetworkSpawned)
+            {
+                return false;
+            }
+
+            NetworkIdentity identity = behaviour.Identity;
+            if (Mode == NetworkProcessMode.Client)
+            {
+                return descriptor.Target == RpcTarget.Server
+                    && identity.HasLocalOwnership
+                    && ServerConnection != null
+                    && ServerConnection.IsReady
+                    && SendRpcToConnection(
+                        ServerConnection,
+                        identity,
+                        behaviour.ReplicationId,
+                        descriptor,
+                        payload);
+            }
+
+            if (Mode != NetworkProcessMode.DedicatedServer || !identity.HasAuthority)
+            {
+                return false;
+            }
+
+            if (descriptor.Target == RpcTarget.OwningClient)
+            {
+                GameNetConnection owner = FindReadyConnection(identity.OwnerConnectionId);
+                return owner != null
+                    && SendRpcToConnection(
+                        owner,
+                        identity,
+                        behaviour.ReplicationId,
+                        descriptor,
+                        payload);
+            }
+
+            if (descriptor.Target != RpcTarget.Multicast)
+            {
+                return false;
+            }
+
+            List<GameNetConnection> targets = GetReadyConnections();
+            bool allSent = true;
+            for (int i = 0; i < targets.Count; i++)
+            {
+                GameNetConnection target = targets[i];
+                if (!target.TryGetActorChannelByNetId(identity.NetId, out _))
+                {
+                    continue;
+                }
+
+                allSent &= SendRpcToConnection(
+                    target,
+                    identity,
+                    behaviour.ReplicationId,
+                    descriptor,
+                    payload);
+            }
+
+            return allSent;
+        }
+
         public void DisconnectConnection(GameNetConnection connection, string reason)
         {
             if (connection == null
@@ -380,6 +452,21 @@ namespace RPGDemo.GameFramework.Networking
                 return;
             }
 
+            if (RpcProtocol.TryReadMessageType(packet, out RpcMessageType rpcMessageType))
+            {
+                if (!connection.IsReady)
+                {
+                    RejectOrClose(
+                        connection,
+                        ConnectionRejectReason.UnexpectedMessage,
+                        $"RPC message {rpcMessageType} received before Ready");
+                    return;
+                }
+
+                HandleRpcPacket(connection, rpcMessageType, packet);
+                return;
+            }
+
             RejectOrClose(connection, ConnectionRejectReason.InvalidPacket, "Unknown or empty network packet");
         }
 
@@ -615,7 +702,10 @@ namespace RPGDemo.GameFramework.Networking
             Debug.Log(
                 $"[Net][DS] ActorChannel {channelId} open acknowledged by connection "
                 + $"{connection.ConnectionId} for NetId={netId}.");
-            SendInitialObjectStates(connection, channel);
+            if (SendInitialObjectStates(connection, channel))
+            {
+                FlushPendingReliableRpcs(connection, channel);
+            }
         }
 
         private void HandleActorChannelOpen(GameNetConnection connection, byte[] packet)
@@ -734,6 +824,83 @@ namespace RPGDemo.GameFramework.Networking
             {
                 CloseConnection(connection, "Invalid ObjectState packet");
             }
+        }
+
+        private void HandleRpcPacket(
+            GameNetConnection connection,
+            RpcMessageType messageType,
+            byte[] packet)
+        {
+            if (messageType != RpcMessageType.Invoke
+                || !RpcProtocol.TryReadInvocation(packet, out RpcInvocationMessage invocation)
+                || !connection.TryGetActorChannel(
+                    invocation.ChannelId,
+                    out ActorReplicationChannel channel)
+                || channel.Actor == null
+                || channel.NetId != invocation.NetId
+                || channel.Actor.AuthorityEpoch != invocation.AuthorityEpoch
+                || !channel.TryGetObjectReplicator(
+                    invocation.ReplicationId,
+                    out ObjectReplicator replicator)
+                || !replicator.TryGetRpcDescriptor(
+                    invocation.FunctionId,
+                    out RpcDescriptor descriptor))
+            {
+                RejectOrClose(
+                    connection,
+                    ConnectionRejectReason.InvalidPacket,
+                    "Malformed RPC invocation or unknown target");
+                return;
+            }
+
+            RpcTarget expectedTarget;
+            if (Mode == NetworkProcessMode.DedicatedServer)
+            {
+                expectedTarget = RpcTarget.Server;
+                if (descriptor.Target != expectedTarget
+                    || channel.Actor.OwnerConnectionId != connection.ConnectionId)
+                {
+                    RejectOrClose(
+                        connection,
+                        ConnectionRejectReason.UnexpectedMessage,
+                        "Client sent an unauthorized RPC invocation");
+                    return;
+                }
+            }
+            else
+            {
+                expectedTarget = descriptor.Target;
+                if (expectedTarget != RpcTarget.OwningClient
+                    && expectedTarget != RpcTarget.Multicast)
+                {
+                    CloseConnection(connection, "Server sent an invalid RPC direction");
+                    return;
+                }
+
+                if (expectedTarget == RpcTarget.OwningClient
+                    && channel.Actor.OwnerConnectionId != connection.ConnectionId)
+                {
+                    CloseConnection(connection, "Server sent an owning-client RPC to a non-owner");
+                    return;
+                }
+            }
+
+            if (!replicator.TryInvokeRemoteProcedure(
+                    invocation.FunctionId,
+                    expectedTarget,
+                    invocation.Payload))
+            {
+                RejectOrClose(
+                    connection,
+                    ConnectionRejectReason.InvalidPacket,
+                    "RPC payload or handler rejected the invocation");
+                return;
+            }
+
+            Debug.Log(
+                $"[Net][RPC][{Mode}] Received target={expectedTarget}, "
+                + $"NetId={invocation.NetId}, ReplicationId={invocation.ReplicationId}, "
+                + $"FunctionId={invocation.FunctionId}, Bytes={invocation.Payload.Length}.");
         }
 
         private void HandleCharacterMovementPacket(
@@ -973,13 +1140,13 @@ namespace RPGDemo.GameFramework.Networking
             return true;
         }
 
-        private void SendInitialObjectStates(
+        private bool SendInitialObjectStates(
             GameNetConnection connection,
             ActorReplicationChannel channel)
         {
             if (connection == null || channel == null || !channel.SpawnAcked || channel.Actor == null)
             {
-                return;
+                return false;
             }
 
             foreach (ObjectReplicator replicator in channel.ObjectReplicators)
@@ -1002,7 +1169,7 @@ namespace RPGDemo.GameFramework.Networking
                     state);
                 if (!TrySendReliable(connection, packet, "InitialObjectState"))
                 {
-                    return;
+                    return false;
                 }
 
                 Debug.Log(
@@ -1011,6 +1178,85 @@ namespace RPGDemo.GameFramework.Networking
             }
 
             channel.LastReplicatedTick = serverTick;
+            return true;
+        }
+
+        private bool SendRpcToConnection(
+            GameNetConnection connection,
+            NetworkIdentity identity,
+            ushort replicationId,
+            RpcDescriptor descriptor,
+            byte[] payload)
+        {
+            if (connection == null
+                || !connection.IsReady
+                || identity == null
+                || descriptor == null
+                || !connection.TryGetActorChannelByNetId(
+                    identity.NetId,
+                    out ActorReplicationChannel channel)
+                || channel.Actor == null
+                || channel.Actor.AuthorityEpoch != identity.AuthorityEpoch
+                || !channel.TryGetObjectReplicator(replicationId, out ObjectReplicator replicator)
+                || !replicator.TryGetRpcDescriptor(descriptor.FunctionId, out RpcDescriptor localDescriptor)
+                || localDescriptor.Target != descriptor.Target
+                || localDescriptor.Delivery != descriptor.Delivery)
+            {
+                return false;
+            }
+
+            if (Mode == NetworkProcessMode.DedicatedServer && !channel.SpawnAcked)
+            {
+                if (descriptor.Delivery == RpcDelivery.Unreliable)
+                {
+                    return true;
+                }
+
+                if (channel.TryEnqueueReliableRpc(
+                        replicationId,
+                        descriptor.FunctionId,
+                        payload))
+                {
+                    return true;
+                }
+
+                CloseConnection(connection, "Reliable RPC queue overflow while ActorChannel was opening");
+                return false;
+            }
+
+            byte[] packet = RpcProtocol.CreateInvocation(
+                channel.ChannelId,
+                identity.NetId,
+                identity.AuthorityEpoch,
+                replicationId,
+                descriptor.FunctionId,
+                payload);
+
+            return descriptor.Delivery == RpcDelivery.Reliable
+                ? TrySendReliable(connection, packet, "RPC")
+                : SendUnreliable(connection, packet);
+        }
+
+        private void FlushPendingReliableRpcs(
+            GameNetConnection connection,
+            ActorReplicationChannel channel)
+        {
+            while (connection.IsReady
+                && channel.SpawnAcked
+                && channel.TryDequeueReliableRpc(out PendingRpcCall call))
+            {
+                byte[] packet = RpcProtocol.CreateInvocation(
+                    channel.ChannelId,
+                    channel.NetId,
+                    channel.Actor.AuthorityEpoch,
+                    call.ReplicationId,
+                    call.FunctionId,
+                    call.Payload);
+                if (!TrySendReliable(connection, packet, "QueuedRPC"))
+                {
+                    return;
+                }
+            }
         }
 
         private void ReplicateActorStates()
@@ -1317,6 +1563,24 @@ namespace RPGDemo.GameFramework.Networking
             }
 
             return readyConnections;
+        }
+
+        private GameNetConnection FindReadyConnection(uint connectionId)
+        {
+            if (connectionId == 0)
+            {
+                return null;
+            }
+
+            foreach (GameNetConnection connection in connections.Values)
+            {
+                if (connection.IsReady && connection.ConnectionId == connectionId)
+                {
+                    return connection;
+                }
+            }
+
+            return null;
         }
 
         private static ulong CreateNonce()

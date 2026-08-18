@@ -17,6 +17,19 @@ namespace RPGDemo.GameFramework.Networking.Replication
         public NetworkBehaviour Target { get; }
         public ushort ReplicationId => Target.ReplicationId;
 
+        internal bool TryGetRpcDescriptor(ushort functionId, out RpcDescriptor descriptor)
+        {
+            return Target.TryGetRpcDescriptor(functionId, out descriptor);
+        }
+
+        internal bool TryInvokeRemoteProcedure(
+            ushort functionId,
+            RpcTarget expectedTarget,
+            byte[] payload)
+        {
+            return Target.TryInvokeRemoteProcedure(functionId, expectedTarget, payload);
+        }
+
         internal bool TryCaptureState(
             bool force,
             out ushort sequence,
